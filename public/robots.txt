@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://landing-critic.com/sitemap.xml
