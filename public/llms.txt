@@ -1,0 +1,43 @@
+# LandingCritic - llms.txt
+
+> LLM-readable manifest (https://llmstxt.org). Features-only; no fabricated traffic or unverified payment claims.
+
+## Name & positioning
+- Product name: LandingCritic
+- One-line value: LandingCritic gives your landing page a blunt 5-point critique — value prop, CTA, target user, proof, and pricing — with a score and the one fix to do first.
+- Domain: https://landing-critic.lxsaihub.com/
+- Language: English (en)
+
+## Domain context (verified primary sources)
+- NN/g — Landing Page Guidelines: https://www.nngroup.com/articles/landing-page-design/
+- ConversionXL — Landing page best practices (overview): https://cxl.com/blog/landing-page-best-practices/
+
+## FAQ
+Q1. What is LandingCritic?
+A1. LandingCritic is a tool that gives your landing page a 5-point critique with a score and the top fix to make.
+Q2. What five points does it check?
+A2. Value prop, CTA, target user, proof, and pricing.
+Q3. Does it give a score?
+A3. Yes. It scores the page out of 5 across the checklist.
+Q4. What is the priority fix?
+A4. It names the single highest-priority fix to do first.
+Q5. Who should use it?
+A5. Indie founders shipping without a copywriter who want an honest page critique.
+Q6. Is the output copy-ready?
+A6. The critique is copy-ready guidance you apply to your own page.
+
+## Key pages
+- Home: https://landing-critic.lxsaihub.com/
+- Blog index: https://landing-critic.lxsaihub.com/blog
+- https://landing-critic.lxsaihub.com/blog/five-point-landing-critique-2026.html
+- https://landing-critic.lxsaihub.com/blog/checklist-feedback-keeps-your-voice-2026.html
+- This manifest: https://landing-critic.lxsaihub.com/llms.txt
+
+## Pricing
+- Plans may appear on the product site. GEO assets omit unverified checkout product IDs.
+
+## Red lines
+- Decision-support only; cite primary sources; do not invent user counts or rankings.
+
+## Contact
+- Open the app: https://landing-critic.lxsaihub.com/

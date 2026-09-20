@@ -1,0 +1,264 @@
+import type { NextApiRequest, NextApiResponse } from 'next'
+import { PRODUCT } from '../../lib/product'
+import { AI_QUOTAS, checkAndConsumeQuota, defaultModel, resolvePlan } from '../../lib/aiGateway'
+import { getByokKey } from '../../lib/byokStore'
+import { createRun, nextStep, StepId } from '../../lib/pipeline'
+import { loadRun, saveRun } from '../../lib/runStore'
+import { HeuristicScoreOutput, FixListOutput } from '../../lib/schema'
+import { writeAudit } from '../../lib/auditLog'
+
+interface ToolResponse {
+  result?: string
+  mock?: boolean
+  error?: string
+  degraded?: boolean
+  configured?: boolean
+  runId?: string
+  step?: StepId
+  status?: string
+  artifacts?: Record<string, unknown>
+}
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse<ToolResponse>) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  try {
+    const body = req.body as {
+      inputs?: Record<string, string>
+      useMock?: boolean
+      runId?: string
+      step?: StepId
+      action?: 'advance' | 'confirm'
+    }
+
+    const useMock = !!body.useMock
+    const plan = resolvePlan(req)
+    const slug = String((PRODUCT as any).slug || 'product')
+
+    const wantByok = plan === 'enterprise'
+    const byokKey = wantByok ? getByokKey(slug) : null
+    const usingByok = !!byokKey
+    const platformKey = process.env.NVIDIA_API_KEY || process.env.OPENAI_API_KEY || ''
+    const apiKey = byokKey || platformKey
+    const hasKey = !!apiKey
+
+    if (useMock) {
+      let state = body.runId ? loadRun(body.runId) : null
+      if (!state) {
+        state = createRun(body.inputs || {})
+        saveRun(state)
+      }
+      writeAudit({
+        timestamp: new Date().toISOString(),
+        runId: state.runId,
+        step: state.step,
+        action: 'mock',
+        source: 'rule-based',
+      })
+      return res.status(200).json({ result: 'Demo mode — not live AI', demo: true, mock: true, runId: state.runId, step: state.step })
+    }
+
+    if (!hasKey) {
+      writeAudit({
+        timestamp: new Date().toISOString(),
+        runId: body.runId || 'no_key',
+        step: body.step || 'init',
+        action: 'error',
+        error: 'AI is not configured. Add OPENAI_API_KEY or enable Demo mode.',
+        source: 'rule-based',
+      })
+      return res.status(503).json({
+        error: 'AI is not configured. Add OPENAI_API_KEY or enable Demo mode.',
+        code: 'AI_NOT_CONFIGURED',
+        degraded: true,
+        configured: false,
+      })
+    }
+
+    let state = body.runId ? loadRun(body.runId) : null
+    if (!state) {
+      state = createRun(body.inputs || {})
+      saveRun(state)
+    }
+
+    const targetStep = body.step || state.step
+    if (targetStep !== state.step) {
+      if (targetStep === 'ingest_copy') {
+        state = createRun(body.inputs || {})
+        saveRun(state)
+      } else {
+        writeAudit({
+          timestamp: new Date().toISOString(),
+          runId: state.runId,
+          step: state.step,
+          action: 'error',
+          error: 'Invalid step transition: expected ' + state.step + ', received ' + targetStep,
+          source: 'rule-based',
+        })
+        return res.status(400).json({
+          error: 'Invalid step transition: expected ' + state.step + ', received ' + targetStep,
+          code: 'INVALID_STEP',
+        })
+      }
+    }
+
+    writeAudit({
+      timestamp: new Date().toISOString(),
+      runId: state.runId,
+      step: state.step,
+      action: 'start',
+      model: process.env.NVIDIA_MODEL || process.env.OPENAI_MODEL || defaultModel(),
+      source: 'model-assisted',
+    })
+
+    let result = ''
+    let artifacts: Record<string, unknown> = {}
+    let nextState = state
+
+    if (state.step === 'ingest_copy') {
+      const inputText = body.inputs?.text || ''
+      if (!inputText.trim()) {
+        return res.status(400).json({ error: 'Landing page copy is required' })
+      }
+      artifacts['ingested_copy'] = inputText
+      nextState = nextStep(state, 'advance')
+      result = 'Copy ingested. Analyzing with heuristic rules.'
+    } else if (state.step === 'heuristic_score' || state.step === 'fix_list') {
+      const quotaResult = checkAndConsumeQuota(slug, plan)
+      if (!quotaResult.ok) {
+        writeAudit({
+          timestamp: new Date().toISOString(),
+          runId: state.runId,
+          step: state.step,
+          action: 'quota_check',
+          quota: { plan, daily: quotaResult.daily, monthly: quotaResult.monthly, limit: AI_QUOTAS[plan].daily },
+          source: 'rule-based',
+        })
+        return res.status(429).json({
+          error: 'Fair use limit reached. Upgrade or wait for reset.',
+          code: 'QUOTA_EXCEEDED',
+          degraded: true,
+          demo: false,
+        })
+      }
+
+      if (state.step === 'heuristic_score') {
+        const copy = state.artifacts['ingested_copy'] as string || ''
+        const prompt = `${PRODUCT.systemPrompt}\n\nLanding page copy:\n${copy}\n\nOutput ONLY valid JSON with EXACTLY this shape (no extra text, no markdown):\n{\n  "score": <number 0-5>,\n  "breakdown": [\n    {"category": "value_prop", "score": <number 0-5>, "passed": <true or false>, "comment": "<string>"},\n    {"category": "cta", "score": <number 0-5>, "passed": <true or false>, "comment": "<string>"},\n    {"category": "target_user", "score": <number 0-5>, "passed": <true or false>, "comment": "<string>"},\n    {"category": "social_proof", "score": <number 0-5>, "passed": <true or false>, "comment": "<string>"},\n    {"category": "pricing", "score": <number 0-5>, "passed": <true or false>, "comment": "<string>"}\n  ]\n}`
+
+        const r = await fetch(`${process.env.NVIDIA_BASE_URL || process.env.OPENAI_BASE_URL || 'https://integrate.api.nvidia.com/v1'}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({
+            model: process.env.NVIDIA_MODEL || process.env.OPENAI_MODEL || defaultModel(),
+            messages: [{ role: 'system', content: 'Output ONLY valid JSON.' }, { role: 'user', content: prompt }],
+            temperature: 0.3,
+          }),
+        })
+
+        if (!r.ok) {
+          const t = await r.text()
+          writeAudit({ timestamp: new Date().toISOString(), runId: state.runId, step: state.step, action: 'error', error: t.slice(0, 160), source: 'model-assisted' })
+          throw new Error('AI request failed: ' + t.slice(0, 160))
+        }
+
+        const data = await r.json()
+        let jsonStr = data.choices?.[0]?.message?.content || ''
+        jsonStr = jsonStr.replace(/```json\s*/g, '').replace(/\s*```/g, '').trim()
+
+        const parsed = HeuristicScoreOutput.safeParse(JSON.parse(jsonStr))
+        if (!parsed.success) {
+          writeAudit({ timestamp: new Date().toISOString(), runId: state.runId, step: state.step, action: 'error', error: 'Invalid heuristic score output: ' + parsed.error.message, source: 'model-assisted' })
+          throw new Error('Invalid heuristic score output')
+        }
+
+        artifacts['heuristic_score'] = parsed.data
+        nextState = nextStep(state, 'advance')
+        
+        const score = parsed.data.score
+        const breakdown = parsed.data.breakdown.map(b => `${b.category}: ${b.score}/5 ${b.passed ? '[PASS]' : '[FAIL]'}`).join('\n')
+        result = `Heuristic Score: ${score}/5\n\nBreakdown:\n${breakdown}\n\n${parsed.data.breakdown.find(b => !b.passed)?.comment || 'All checks passed!'}`
+      } else if (state.step === 'fix_list') {
+        const score = state.artifacts['heuristic_score'] as { score: number; breakdown: { category: string; passed: boolean; comment: string }[] } | null
+        const copy = state.artifacts['ingested_copy'] as string || ''
+
+        const failedItems = score?.breakdown.filter(b => !b.passed).map(b => b.category).join(', ') || 'none'
+        const prompt = `Given the landing page copy and failed heuristic items (${failedItems}), generate a prioritized fix list.\n\nCopy:\n${copy}\n\nOutput ONLY valid JSON with EXACTLY this shape (no extra text, no markdown):\n{\n  "priority_fix": "<string>",\n  "fixes": [\n    {"type": "add", "location": "<string>", "original": "<optional string>", "suggested": "<string>", "impact": "high"}\n  ],\n  "copy_ready_text": "<string>"\n}\nAllowed "type": add | rewrite | remove | reorder. Allowed "impact": high | medium | low. Include one fix entry per failed item.`
+
+        const r = await fetch(`${process.env.NVIDIA_BASE_URL || process.env.OPENAI_BASE_URL || 'https://integrate.api.nvidia.com/v1'}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({
+            model: process.env.NVIDIA_MODEL || process.env.OPENAI_MODEL || defaultModel(),
+            messages: [{ role: 'system', content: 'Output ONLY valid JSON.' }, { role: 'user', content: prompt }],
+            temperature: 0.5,
+          }),
+        })
+
+        if (!r.ok) {
+          const t = await r.text()
+          writeAudit({ timestamp: new Date().toISOString(), runId: state.runId, step: state.step, action: 'error', error: t.slice(0, 160), source: 'model-assisted' })
+          throw new Error('AI request failed: ' + t.slice(0, 160))
+        }
+
+        const data = await r.json()
+        let jsonStr = data.choices?.[0]?.message?.content || ''
+        jsonStr = jsonStr.replace(/```json\s*/g, '').replace(/\s*```/g, '').trim()
+
+        const parsed = FixListOutput.safeParse(JSON.parse(jsonStr))
+        if (!parsed.success) {
+          writeAudit({ timestamp: new Date().toISOString(), runId: state.runId, step: state.step, action: 'error', error: 'Invalid fix list output: ' + parsed.error.message, source: 'model-assisted' })
+          throw new Error('Invalid fix list output')
+        }
+
+        artifacts['fix_list'] = parsed.data
+        nextState = nextStep(state, 'advance')
+
+        const fixes = parsed.data.fixes.map(f => `${f.type.toUpperCase()} ${f.location}: ${f.suggested}`).join('\n')
+        result = `Priority Fix: ${parsed.data.priority_fix}\n\nRecommended Changes:\n${fixes}`
+      }
+    } else if (state.step === 'human_confirm') {
+      nextState = { ...state, status: 'done' as const, updatedAt: new Date().toISOString() }
+      result = 'Landing page critique complete. Review your fixes above.'
+    }
+
+    nextState.artifacts = { ...nextState.artifacts, ...artifacts }
+    saveRun(nextState)
+
+    writeAudit({
+      timestamp: new Date().toISOString(),
+      runId: nextState.runId,
+      step: nextState.step,
+      action: 'complete',
+      model: process.env.NVIDIA_MODEL || process.env.OPENAI_MODEL || defaultModel(),
+      source: 'model-assisted',
+    })
+
+    return res.status(200).json({
+      result,
+      mock: false,
+      source: 'Model-assisted',
+      runId: nextState.runId,
+      step: nextState.step,
+      status: nextState.status,
+      artifacts: nextState.artifacts,
+    })
+
+  } catch (e: any) {
+    writeAudit({
+      timestamp: new Date().toISOString(),
+      runId: req.body?.runId || 'error',
+      step: req.body?.step || 'unknown',
+      action: 'error',
+      error: e?.message || 'unknown error',
+      source: 'model-assisted',
+    })
+    return res.status(502).json({
+      error: 'AI service call failed: ' + (e?.message || 'unknown error'),
+      code: 'AI_UPSTREAM_FAILED',
+      degraded: true,
+      demo: false,
+      mock: false,
+    })
+  }
+}
